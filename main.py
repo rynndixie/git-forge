@@ -30,6 +30,7 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -3325,6 +3326,69 @@ class ForgeServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def _resolve_data_dir(requested):
+    """Pick a writable data dir: the requested one when it can be created
+    and written, else a scratch dir under the system temp dir. The trial
+    pod mounts the entry's snapshot read-only at /bot, so a relative data
+    dir under the cwd cannot be created there and Store() would crash
+    before the server binds; /tmp is a writable tmpfs in that container.
+    """
+    for cand in (Path(requested), Path(tempfile.gettempdir()) / "git-forge-data"):
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return cand
+        except OSError:
+            continue
+    return Path(requested)
+
+
+def _env_lifecycle(srv, port):
+    """The trial pod's lifecycle (RULES.txt): register the bound port with
+    the suite env, then poll /done until the env says the trial is over
+    and shut the server down. Runs in a thread; serve_forever() owns the
+    main thread. Only started when MAKEFUN_ENV_URL is set; without an env
+    (local dev) the server just serves forever as before.
+    """
+    import urllib.request
+    env = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
+    if not env:
+        return
+    body = json.dumps({"port": port}).encode()
+    attempt = 0
+    while True:
+        try:
+            req = urllib.request.Request(env + "/register", data=body,
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status in (200, 409):
+                    break
+                if resp.status in (400, 405):
+                    print(f"[entry] register answered HTTP {resp.status}; not retrying",
+                          flush=True)
+                    return
+        except Exception:
+            pass
+        time.sleep(min(2.0, 0.25 * (2 ** min(attempt, 3))))
+        attempt += 1
+    print("[entry] registered; waiting for the env to say done", flush=True)
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(env + "/done", timeout=30) as resp:
+                if resp.status == 200 and json.loads(resp.read().decode()).get("done") is True:
+                    break
+        except Exception:
+            pass
+        time.sleep(min(2.0, 0.25 * (2 ** min(attempt, 3))))
+        attempt += 1
+    print("[entry] done", flush=True)
+    srv.shutdown()
+
+
 def main():
     global STORE
     ap = argparse.ArgumentParser(description="git-forge v1")
@@ -3333,13 +3397,16 @@ def main():
                     default=int(os.environ.get("PORT") or os.environ.get("FORGE_PORT") or 0))
     ap.add_argument("--data-dir", default=os.environ.get("FORGE_DATA_DIR", "data"))
     args = ap.parse_args()
-    STORE = Store(Path(args.data_dir))
+    data_dir = _resolve_data_dir(args.data_dir)
+    STORE = Store(data_dir)
     srv = ForgeServer((args.host, args.port), Handler)
     port = srv.server_address[1]
-    (Path(args.data_dir) / "port.txt").write_text(str(port), encoding="utf-8")
+    (data_dir / "port.txt").write_text(str(port), encoding="utf-8")
     print(f"FORGE_PORT={port}", flush=True)
     print(f"git-forge {VERSION} listening on {args.host}:{port} "
-          f"data={args.data_dir}", flush=True)
+          f"data={data_dir}", flush=True)
+    if os.environ.get("MAKEFUN_ENV_URL", "").strip():
+        threading.Thread(target=_env_lifecycle, args=(srv, port), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
